@@ -1,0 +1,340 @@
+name: "ScarletLaw → iOS IPA (Sideload)"
+
+# ─────────────────────────────────────────────────────────────
+# ScarletLaw 0.4.2 — Ren'Py 8.4.0 (Tomorrowland)
+# macOS runner'da imzasız IPA build eder.
+# ~2.7 GB archive.rpa → Git LFS gerektirir.
+# ─────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      renpy_version:
+        description: "Ren'Py SDK sürümü"
+        required: true
+        default: "8.4.0"
+      bundle_id:
+        description: "iOS Bundle ID"
+        required: true
+        default: "com.acbf.scarletlaw"
+      app_display_name:
+        description: "Uygulama adı"
+        required: true
+        default: "Scarlet Law"
+
+jobs:
+  build-ipa:
+    name: "Build ScarletLaw IPA"
+    runs-on: macos-14
+    timeout-minutes: 90          # Büyük proje — süre artırıldı
+
+    env:
+      RENPY_VERSION: ${{ inputs.renpy_version || '8.4.0' }}
+      BUNDLE_ID:     ${{ inputs.bundle_id || 'com.acbf.scarletlaw' }}
+      APP_NAME:      ${{ inputs.app_display_name || 'Scarlet Law' }}
+      PROJECT_DIR:   "ScarletLaw-pc"
+
+    steps:
+      # ── 1. Checkout (LFS dahil) ─────────────────────────────
+      - name: "📥 Checkout (with LFS)"
+        uses: actions/checkout@v4
+        with:
+          lfs: true            # archive.rpa Git LFS'te
+
+      - name: "📦 Pull LFS Objects"
+        run: git lfs pull
+
+      # ── 2. Proje doğrulama ve Parçaları Birleştirme ──────────
+      - name: "✅ Assemble Archive & Validate ScarletLaw"
+        run: |
+          echo "Checking project structure..."
+
+          if [ ! -d "$PROJECT_DIR/game" ]; then
+            echo "::error::$PROJECT_DIR/game klasörü bulunamadı!"
+            ls -la
+            exit 1
+          fi
+
+          # Parçaları birleştir (archive.rpa.part01 + archive.rpa.part02 -> archive.rpa)
+          ARCHIVE="$PROJECT_DIR/game/archive.rpa"
+          if ls "$PROJECT_DIR/game/archive.rpa.part"* 1> /dev/null 2>&1; then
+            echo "Reassembling archive.rpa from parts..."
+            cat "$PROJECT_DIR/game/archive.rpa.part"* > "$ARCHIVE"
+            rm -f "$PROJECT_DIR/game/archive.rpa.part"*
+            echo "Reassembly complete."
+          fi
+
+          # archive.rpa LFS pointer mı yoksa gerçek dosya mı kontrol
+          if [ -f "$ARCHIVE" ]; then
+            SIZE=$(stat -f%z "$ARCHIVE" 2>/dev/null || stat -c%s "$ARCHIVE" 2>/dev/null)
+            echo "archive.rpa size: $SIZE bytes"
+            if [ "$SIZE" -lt 1000000 ]; then
+              echo "::error::archive.rpa LFS pointer olarak kalmış! git lfs pull çalışmamış olabilir."
+              cat "$ARCHIVE"
+              exit 1
+            fi
+            echo "✓ archive.rpa OK ($((SIZE / 1048576)) MB)"
+          else
+            echo "::error::archive.rpa bulunamadı!"
+            exit 1
+          fi
+
+          echo "✓ Project validated"
+          du -sh "$PROJECT_DIR"
+
+      # ── 3. Python kur ───────────────────────────────────────
+      - name: "🐍 Setup Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ── 4. Xcode ayarla ─────────────────────────────────────
+      - name: "🔧 Select Xcode"
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+
+      # ── 5. Ren'Py 8.4.0 SDK indir ──────────────────────────
+      - name: "⬇️ Download Ren'Py SDK"
+        run: |
+          echo "::group::Downloading Ren'Py $RENPY_VERSION"
+
+          # Ren'Py SDK indirme linki
+          SDK_URL="https://www.renpy.org/dl/${RENPY_VERSION}/renpy-${RENPY_VERSION}-sdk.tar.bz2"
+
+          echo "Downloading from: $SDK_URL"
+          curl -fSL "$SDK_URL" -o renpy-sdk.tar.bz2 \
+            || { echo "::error::SDK indirilemedi! Sürümü kontrol edin: $RENPY_VERSION"; exit 1; }
+
+          tar xf renpy-sdk.tar.bz2
+          mv renpy-*-sdk renpy-sdk
+          echo "RENPY_SDK=$PWD/renpy-sdk" >> $GITHUB_ENV
+          echo "::endgroup::"
+
+      # ── 6. iOS Support indir ────────────────────────────────
+      - name: "📱 Download iOS Support"
+        run: |
+          echo "::group::Downloading iOS Support"
+
+          IOS_URL="https://www.renpy.org/dl/${RENPY_VERSION}/renpy-${RENPY_VERSION}-ios.tar.bz2"
+
+          if curl --head --silent --fail "$IOS_URL" > /dev/null 2>&1; then
+            curl -fSL "$IOS_URL" -o renpy-ios.tar.bz2
+            tar xf renpy-ios.tar.bz2
+            cp -R renpy-*-ios/* renpy-sdk/ 2>/dev/null || true
+            echo "✓ iOS support installed"
+          else
+            echo "::warning::Direct iOS support archive not found."
+            echo "Trying Ren'Py launcher auto-download..."
+
+            # Ren'Py launcher bazen iOS desteğini otomatik indirir
+            cd renpy-sdk
+            python3 renpy.py --help 2>/dev/null || true
+            cd ..
+          fi
+
+          echo "::endgroup::"
+
+      # ── 7. Oyunu iOS build'e hazırla ────────────────────────
+      - name: "🧹 Prepare Game for iOS"
+        run: |
+          GAME_PATH="$GITHUB_WORKSPACE/$PROJECT_DIR"
+
+          # PC-only dosyaları temizle (iOS'ta gereksiz)
+          rm -f "$GAME_PATH/ScarletLaw.exe" 2>/dev/null
+          rm -f "$GAME_PATH/ScarletLaw.sh" 2>/dev/null
+          rm -rf "$GAME_PATH/lib" 2>/dev/null
+          rm -rf "$GAME_PATH/cache" 2>/dev/null
+          rm -rf "$GAME_PATH/game/cache" 2>/dev/null
+          rm -rf "$GAME_PATH/game/saves" 2>/dev/null
+          rm -rf "$GAME_PATH/saves" 2>/dev/null
+          rm -rf "$GAME_PATH/update" 2>/dev/null
+          rm -f "$GAME_PATH/log.txt" 2>/dev/null
+
+          echo "✓ Cleaned PC-only files"
+          echo "Game size after cleanup:"
+          du -sh "$GAME_PATH"
+
+      # ── 8. Xcode projesi oluştur ────────────────────────────
+      - name: "🏗️ Generate Xcode Project"
+        run: |
+          echo "::group::Creating Xcode project"
+
+          GAME_PATH="$GITHUB_WORKSPACE/$PROJECT_DIR"
+          IOS_BUILD="$GAME_PATH/ios-build"
+
+          cd renpy-sdk
+
+          # Yöntem 1: renpy.sh üzerinden ios_create
+          ./renpy.sh launcher ios_create "$GAME_PATH" "$IOS_BUILD" 2>&1 \
+            || {
+              echo "Method 1 failed, trying method 2..."
+
+              # Yöntem 2: Python ile doğrudan
+              PYTHON=$(find lib -name "python3*" -type f -executable 2>/dev/null | head -1)
+              if [ -n "$PYTHON" ]; then
+                "./$PYTHON" renpy.py launcher ios_create "$GAME_PATH" "$IOS_BUILD" 2>&1
+              else
+                python3 renpy.py launcher ios_create "$GAME_PATH" "$IOS_BUILD" 2>&1
+              fi
+            } \
+            || {
+              echo "Method 2 failed, trying method 3..."
+
+              # Yöntem 3: renios modülü doğrudan
+              if [ -d "renios" ]; then
+                python3 -m renios.interface "$GAME_PATH" create --dest "$IOS_BUILD"
+              else
+                echo "::error::Tüm yöntemler başarısız! Ren'Py iOS desteği kurulu değil."
+                echo "SDK içeriği:"
+                ls -la
+                exit 1
+              fi
+            }
+
+          echo "IOS_BUILD=$IOS_BUILD" >> $GITHUB_ENV
+          echo "::endgroup::"
+
+          echo "Xcode project contents:"
+          find "$IOS_BUILD" -maxdepth 2 -type f -o -type d | head -30
+
+      # ── 9. Bundle ID ve isim patch ──────────────────────────
+      - name: "📝 Patch Bundle ID & Display Name"
+        run: |
+          # Tüm Info.plist dosyalarını bul ve güncelle
+          find "$IOS_BUILD" -name "Info.plist" -not -path "*/DerivedData/*" -not -path "*/build/*" | while read PLIST; do
+            echo "Patching: $PLIST"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID" "$PLIST" 2>/dev/null \
+              || /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $BUNDLE_ID" "$PLIST"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" "$PLIST" 2>/dev/null \
+              || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $APP_NAME" "$PLIST"
+          done
+
+          echo "✓ Bundle ID: $BUNDLE_ID"
+          echo "✓ Display Name: $APP_NAME"
+
+      # ── 10. İmzasız build ───────────────────────────────────
+      - name: "🔨 Build Unsigned App"
+        run: |
+          echo "::group::xcodebuild"
+
+          cd "$IOS_BUILD"
+
+          # Xcode projesini bul
+          XCPROJECT=$(find . -maxdepth 2 -name "*.xcodeproj" | head -1)
+          XCWORKSPACE=$(find . -maxdepth 2 -name "*.xcworkspace" | head -1)
+
+          if [ -z "$XCPROJECT" ] && [ -z "$XCWORKSPACE" ]; then
+            echo "::error::No Xcode project found!"
+            find . -type f | head -30
+            exit 1
+          fi
+
+          # Scheme bul
+          if [ -n "$XCWORKSPACE" ]; then
+            BUILD_TARGET="-workspace $XCWORKSPACE"
+            SCHEME=$(xcodebuild -workspace "$XCWORKSPACE" -list -json 2>/dev/null \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['workspace']['schemes'][0])" \
+              2>/dev/null) || SCHEME="ScarletLaw"
+          else
+            BUILD_TARGET="-project $XCPROJECT"
+            SCHEME=$(xcodebuild -project "$XCPROJECT" -list -json 2>/dev/null \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['project']['schemes'][0])" \
+              2>/dev/null) || SCHEME="ScarletLaw"
+          fi
+
+          echo "Build target: $BUILD_TARGET"
+          echo "Scheme: $SCHEME"
+
+          # İmzasız build (sideloading için)
+          xcodebuild \
+            $BUILD_TARGET \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$PWD/DerivedData" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            ENABLE_BITCODE=NO \
+            build \
+            2>&1 | tee build.log
+
+          BUILD_EXIT=${PIPESTATUS[0]}
+          if [ $BUILD_EXIT -ne 0 ]; then
+            echo "::error::xcodebuild failed!"
+            echo "--- Last 80 lines of build log ---"
+            tail -80 build.log
+            exit $BUILD_EXIT
+          fi
+
+          echo "::endgroup::"
+          echo "✓ Build successful"
+
+      # ── 11. IPA paketle ─────────────────────────────────────
+      - name: "📦 Package IPA"
+        run: |
+          cd "$IOS_BUILD"
+
+          # .app dosyasını bul
+          APP_PATH=$(find DerivedData -name "*.app" -type d \
+            -path "*/Release-iphoneos/*" | head -1)
+
+          if [ -z "$APP_PATH" ]; then
+            echo "Trying alternative .app search..."
+            APP_PATH=$(find DerivedData -name "*.app" -type d | head -1)
+          fi
+
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::.app bundle not found!"
+            find DerivedData -type d -maxdepth 6
+            exit 1
+          fi
+
+          echo "Found app: $APP_PATH"
+          echo "App size: $(du -sh "$APP_PATH" | cut -f1)"
+
+          # IPA yapısı
+          STAGING="$RUNNER_TEMP/ipa-staging"
+          mkdir -p "$STAGING/Payload"
+          cp -R "$APP_PATH" "$STAGING/Payload/"
+
+          # ZIP → IPA
+          cd "$STAGING"
+          IPA_NAME="ScarletLaw-v0.4.2-sideload.ipa"
+          zip -r -0 "$RUNNER_TEMP/$IPA_NAME" Payload   # -0: sıkıştırma yok (hız)
+
+          echo "IPA_PATH=$RUNNER_TEMP/$IPA_NAME" >> $GITHUB_ENV
+          echo "IPA_NAME=$IPA_NAME" >> $GITHUB_ENV
+
+          IPA_SIZE=$(du -sh "$RUNNER_TEMP/$IPA_NAME" | cut -f1)
+          echo "✅ IPA created: $IPA_NAME ($IPA_SIZE)"
+
+      # ── 12. Artifact olarak yükle ───────────────────────────
+      - name: "☁️ Upload IPA"
+        uses: actions/upload-artifact@v4
+        with:
+          name: "ScarletLaw-sideload-ipa"
+          path: "${{ env.IPA_PATH }}"
+          retention-days: 30
+          compression-level: 0
+
+      # ── 13. Özet ────────────────────────────────────────────
+      - name: "📋 Build Summary"
+        if: always()
+        run: |
+          echo "## 🎮 ScarletLaw iOS Build" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Parametre | Değer |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Oyun | ScarletLaw v0.4.2 |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ren'Py | \`$RENPY_VERSION\` (Tomorrowland) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Bundle ID | \`$BUNDLE_ID\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| IPA | \`$IPA_NAME\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📲 Yükleme" >> $GITHUB_STEP_SUMMARY
+          echo "IPA'yı **AltStore** veya **Sideloadly** ile yükleyin." >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,19 @@
+# Build outputs
+*.ipa
+*.tar.bz2
+DerivedData/
+ios-build/
+renpy-sdk/
+
+# macOS
+.DS_Store
+*.xcuserdata
+
+# Python
+__pycache__/
+*.pyc
+
+# Ren'Py cache
+**/cache/
+**/saves/
+**/tmp/
