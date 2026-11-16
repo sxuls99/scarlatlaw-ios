@@ -25,7 +25,7 @@ on:
 jobs:
   build-ipa:
     name: "Build ScarletLaw IPA"
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 90          # Büyük proje — süre artırıldı
 
     env:
